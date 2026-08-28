@@ -1,0 +1,22 @@
+# models & artifacts — never publish weights
+model/
+*.gguf
+*.plepatch
+*.npy
+*.npz
+
+# the patched llama.cpp fork (separate repo: ggml-org/llama.cpp @ 6c84c7d5)
+llama.cpp-NLTM/
+
+# scratch / working dirs
+ngt/
+build/
+out/
+*.log
+__pycache__/
+*.pyc
+.cache/
+
+# editor
+.vscode/
+.idea/

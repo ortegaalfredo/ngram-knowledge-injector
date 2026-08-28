@@ -1,0 +1,399 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 8922dc12a..6b7790831 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -34,6 +34,7 @@ add_library(llama
+             llama-memory-hybrid-idx.cpp
+             llama-memory-recurrent.cpp
+             llama-mmap.cpp
++            llama-ple-overlay.cpp
+             llama-model-loader.cpp
+             llama-model-saver.cpp
+             llama-model.cpp
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index d9241022c..13f3bebb6 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-model-loader.h"
+ 
++#include "llama-ple-overlay.h"
++
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+ #include "gguf.h"
+@@ -577,6 +579,7 @@ llama_model_loader::llama_model_loader(
+         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+ 
+         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
++        file_paths.push_back(fname);
+         contexts.emplace_back(ctx);
+ 
+         // Save tensors data offset of the main file.
+@@ -645,6 +648,7 @@ llama_model_loader::llama_model_loader(
+                 }
+ 
+                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
++                file_paths.push_back(fname_split);
+                 contexts.emplace_back(ctx);
+ 
+                 // Save tensors data offset info of the shard.
+@@ -1362,6 +1366,46 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
+     }
+ }
+ 
++// Apply the PLE n-gram knowledge overlay, if one is configured, by mapping the
++// patched rows MAP_PRIVATE over the model's read-only mapping. The GGUF on disk
++// is never written; only the pages that hold a patched row are copied.
++void llama_model_loader::apply_ple_overlay() {
++    // resolve the overlay lazily: LLAMA_PLE_OVERLAY env, else "<main>.plepatch"
++    if (ple_overlay.path.empty()) {
++        try {
++            ple_overlay = llama_ple_overlay_for_model(file_paths.empty() ? std::string() : file_paths.front());
++        } catch (const std::exception & ex) {
++            LLAMA_LOG_ERROR("%s: %s\n", __func__, ex.what());
++            throw;
++        }
++    }
++    if (ple_overlay.empty()) {
++        return;
++    }
++    if (!use_mmap) {
++        LLAMA_LOG_WARN("%s: PLE overlay requested but mmap is disabled - ignoring\n", __func__);
++        return;
++    }
++
++    const auto * w = get_weight(ple_overlay.tensor_name.c_str());
++    if (!w) {
++        LLAMA_LOG_WARN("%s: overlay targets tensor '%s' which this model does not have - ignoring\n",
++                       __func__, ple_overlay.tensor_name.c_str());
++        return;
++    }
++    if (w->idx >= file_paths.size() || w->idx >= mappings.size()) {
++        throw std::runtime_error("ple-overlay: shard bookkeeping is inconsistent");
++    }
++
++    const uint64_t data_off = w->offs;
++    const uint64_t n_rows   = (uint64_t) w->tensor->ne[1];
++
++    const size_t applied = llama_ple_overlay_apply(mappings.at(w->idx).get(), ple_overlay,
++                                                   file_paths.at(w->idx), data_off, n_rows);
++    LLAMA_LOG_INFO("%s: applied %zu PLE overlay row(s) to '%s' in %s\n",
++                  __func__, applied, ple_overlay.tensor_name.c_str(), file_paths.at(w->idx).c_str());
++}
++
+ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+     if (use_mmap) {
+         mappings.reserve(files.size());
+diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
+index 407260e99..9f0e981da 100644
+--- a/src/llama-model-loader.h
++++ b/src/llama-model-loader.h
+@@ -6,6 +6,7 @@
+ #include "llama-arch.h"
+ #include "llama-hparams.h"
+ #include "llama-mmap.h"
++#include "llama-ple-overlay.h"
+ 
+ #include "ggml-cpp.h"
+ 
+@@ -92,6 +93,12 @@ struct llama_model_loader {
+ 
+     llama_mmaps mappings;
+ 
++    // paths of the opened files, in file-index order (for the PLE overlay)
++    std::vector<std::string> file_paths;
++
++    // optional n-gram knowledge overlay applied to per_layer_token_embd.weight
++    llama_ple_overlay ple_overlay;
++
+     // byte ranges of TENSOR_READ_LAZY tensors, per file index
+     std::map<uint32_t, llama_mmap::ranges> lazy_tensor_ranges;
+ 
+@@ -199,6 +206,9 @@ struct llama_model_loader {
+ 
+     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+ 
++    // apply the PLE n-gram knowledge overlay (if any) onto the mappings
++    void apply_ple_overlay();
++
+     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+ 
+     // release a weight's mmap pages
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index fc83658dd..75a033655 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1679,6 +1679,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     }
+ 
+     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++
++    // apply any n-gram knowledge overlay before tensors are bound to the mapping
++    ml.apply_ple_overlay();
++
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+diff --git a/src/llama-ple-overlay.cpp b/src/llama-ple-overlay.cpp
+new file mode 100644
+index 000000000..f3547f82e
+--- /dev/null
++++ b/src/llama-ple-overlay.cpp
+@@ -0,0 +1,204 @@
++#include "llama-ple-overlay.h"
++
++#include "llama-impl.h"
++#include "llama-mmap.h"
++
++#include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <stdexcept>
++#include <string>
++
++#include "ggml.h"
++
++#if defined(_POSIX_MAPPED_FILES) || defined(__unix__) || defined(__APPLE__)
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#define PLE_OVERLAY_POSIX 1
++#endif
++
++static uint16_t rd_u16(const uint8_t * p) { uint16_t v; std::memcpy(&v, p, 2); return v; }
++static uint32_t rd_u32(const uint8_t * p) { uint32_t v; std::memcpy(&v, p, 4); return v; }
++static uint64_t rd_u64(const uint8_t * p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
++
++static const char * PLE_OVERLAY_ENV = "LLAMA_PLE_OVERLAY";
++
++llama_ple_overlay llama_ple_overlay_read_index(const char * path) {
++    llama_ple_overlay ov;
++    ov.path = path;
++
++    FILE * f = std::fopen(path, "rb");
++    if (!f) {
++        throw std::runtime_error(std::string("ple-overlay: cannot open ") + path);
++    }
++
++    uint8_t hdr[128];
++    if (std::fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) || std::memcmp(hdr, "PLEOVLY1", 8) != 0) {
++        std::fclose(f);
++        throw std::runtime_error(std::string("ple-overlay: bad magic in ") + path);
++    }
++
++    const uint16_t ver  = rd_u16(hdr + 8);
++    const uint32_t qtype = rd_u32(hdr + 12);
++    const uint64_t row_dim = rd_u64(hdr + 16);
++    const uint64_t bpr     = rd_u64(hdr + 24);
++    const uint64_t n_rows  = rd_u64(hdr + 32);
++    const uint64_t mlen    = rd_u64(hdr + 40);
++
++    if (ver != 1) {
++        std::fclose(f);
++        throw std::runtime_error(format("ple-overlay: unsupported version %u", ver));
++    }
++    if (bpr == 0 || row_dim == 0 || n_rows > (1ull << 32)) {
++        std::fclose(f);
++        throw std::runtime_error("ple-overlay: implausible header");
++    }
++
++    char name[65] = { 0 };
++    std::memcpy(name, hdr + 56, 64);
++    ov.tensor_name   = name;
++    ov.qtype         = qtype;
++    ov.row_dim       = row_dim;
++    ov.bytes_per_row = bpr;
++
++    if (std::fseek(f, (long) (128 + mlen), SEEK_SET) != 0) {
++        std::fclose(f);
++        throw std::runtime_error("ple-overlay: truncated manifest");
++    }
++
++    ov.rows.reserve(n_rows);
++    for (uint64_t i = 0; i < n_rows; i++) {
++        uint8_t rec[8];
++        if (std::fread(rec, 1, 8, f) != 8) {
++            std::fclose(f);
++            throw std::runtime_error("ple-overlay: truncated row index");
++        }
++        llama_ple_overlay_row r;
++        r.row = rd_u64(rec);
++        r.off = (size_t) std::ftell(f);   // payload follows the id
++        if (std::fseek(f, (long) bpr, SEEK_CUR) != 0) {
++            std::fclose(f);
++            throw std::runtime_error("ple-overlay: truncated row payload");
++        }
++        ov.rows.push_back(r);
++    }
++    std::fclose(f);
++
++    std::sort(ov.rows.begin(), ov.rows.end(),
++              [](const llama_ple_overlay_row & a, const llama_ple_overlay_row & b) {
++                  return a.row < b.row;
++              });
++    return ov;
++}
++
++llama_ple_overlay llama_ple_overlay_for_model(const std::string & model_path) {
++    const char * env = std::getenv(PLE_OVERLAY_ENV);
++    std::string path;
++    if (env && env[0]) {
++        path = env;
++    } else if (!model_path.empty()) {
++        path = model_path + ".plepatch";
++        FILE * probe = std::fopen(path.c_str(), "rb");
++        if (!probe) {
++            return {};  // nothing configured
++        }
++        std::fclose(probe);
++    } else {
++        return {};
++    }
++
++    llama_ple_overlay ov = llama_ple_overlay_read_index(path.c_str());
++    LLAMA_LOG_INFO("%s: loaded %zu patched row(s) from %s (tensor=%s qtype=%u row_dim=%llu)\n",
++                  __func__, ov.rows.size(), path.c_str(), ov.tensor_name.c_str(), ov.qtype,
++                  (unsigned long long) ov.row_dim);
++    return ov;
++}
++
++#ifdef PLE_OVERLAY_POSIX
++size_t llama_ple_overlay_apply(llama_mmap * mapping, const llama_ple_overlay & ov,
++                               const std::string & model_file, uint64_t data_off,
++                               uint64_t n_rows) {
++    if (ov.empty() || !mapping) {
++        return 0;
++    }
++
++    uint8_t * base = (uint8_t *) mapping->addr();
++    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    const size_t bpr  = (size_t) ov.bytes_per_row;
++
++    // read the payloads first so the model fd stays closed while we map
++    std::vector<std::pair<uint64_t, std::vector<uint8_t>>> payloads;
++    payloads.reserve(ov.rows.size());
++    {
++        FILE * f = std::fopen(ov.path.c_str(), "rb");
++        if (!f) {
++            throw std::runtime_error("ple-overlay: cannot reopen " + ov.path);
++        }
++        for (const auto & r : ov.rows) {
++            if (r.row >= n_rows) {
++                std::fclose(f);
++                throw std::runtime_error(format("ple-overlay: row %llu outside the table (%llu rows)",
++                                                (unsigned long long) r.row, (unsigned long long) n_rows));
++            }
++            std::vector<uint8_t> buf(bpr);
++            if (std::fseek(f, (long) r.off, SEEK_SET) != 0 || std::fread(buf.data(), 1, bpr, f) != bpr) {
++                std::fclose(f);
++                throw std::runtime_error("ple-overlay: short row payload");
++            }
++            payloads.emplace_back(r.row, std::move(buf));
++        }
++        std::fclose(f);
++    }
++
++    const int fd = ::open(model_file.c_str(), O_RDONLY);
++    if (fd < 0) {
++        throw std::runtime_error("ple-overlay: cannot open model for COW overlay: " + model_file);
++    }
++
++    // Make each touched page MAP_PRIVATE over the read-only shared mapping. The
++    // kernel copies the page on first write, so the file on disk is never touched
++    // and every other reader of the mapping keeps seeing the original bytes.
++    //
++    // Pages are mapped one at a time and only once: re-mapping a page that is
++    // already private would discard a patch applied to a sibling row, and a row
++    // can straddle two pages.
++    size_t applied = 0;
++    std::vector<size_t> mapped_pages;   // sorted page offsets already made private
++
++    for (const auto & pl : payloads) {
++        const size_t off  = (size_t) data_off + (size_t) pl.first * bpr;
++        const size_t pstart = off & ~(page - 1);
++        const size_t pend   = (off + bpr + page - 1) & ~(page - 1);
++
++        for (size_t pg = pstart; pg < pend; pg += page) {
++            if (std::binary_search(mapped_pages.begin(), mapped_pages.end(), pg)) {
++                continue;
++            }
++            void * p = ::mmap(base + pg, page, PROT_READ | PROT_WRITE,
++                              MAP_PRIVATE | MAP_FIXED, fd, (off_t) pg);
++            if (p == MAP_FAILED) {
++                ::close(fd);
++                throw std::runtime_error(format("ple-overlay: COW overlay failed at page %zu: %s",
++                                                pg, strerror(errno)));
++            }
++            mapped_pages.insert(
++                std::lower_bound(mapped_pages.begin(), mapped_pages.end(), pg), pg);
++        }
++        std::memcpy(base + off, pl.second.data(), bpr);
++        applied++;
++    }
++    ::close(fd);
++    return applied;
++}
++#else
++size_t llama_ple_overlay_apply(llama_mmap * mapping, const llama_ple_overlay & ov,
++                               const std::string & model_file, uint64_t data_off,
++                               uint64_t n_rows) {
++    GGML_UNUSED(mapping); GGML_UNUSED(ov); GGML_UNUSED(model_file);
++    GGML_UNUSED(data_off); GGML_UNUSED(n_rows);
++    throw std::runtime_error("ple-overlay: not supported on this platform");
++}
++#endif
+diff --git a/src/llama-ple-overlay.h b/src/llama-ple-overlay.h
+new file mode 100644
+index 000000000..683f7048d
+--- /dev/null
++++ b/src/llama-ple-overlay.h
+@@ -0,0 +1,46 @@
++#pragma once
++
++// PLE n-gram knowledge overlays.
++//
++// A .plepatch file produced by the ngram_tool injector carries replacement rows
++// for the per_layer_token_embd.weight table. Applying it as a MAP_PRIVATE
++// overlay on top of the model's read-only mapping keeps the GGUF on disk
++// byte-for-byte untouched and costs one 4 KiB page per patched row.
++
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++struct llama_file;
++struct llama_mmap;
++
++struct llama_ple_overlay_row {
++    uint64_t row;
++    size_t   off;   // byte offset of the row payload inside the overlay file
++};
++
++struct llama_ple_overlay {
++    std::string path;
++    std::string tensor_name;
++    std::string sha1_before;
++    uint32_t qtype = 0;
++    uint64_t row_dim = 0;
++    uint64_t bytes_per_row = 0;
++    std::vector<llama_ple_overlay_row> rows;  // sorted by row id
++
++    bool empty() const { return rows.empty(); }
++};
++
++// Parse the fixed 128-byte header plus the row index. Throws on a malformed file.
++llama_ple_overlay llama_ple_overlay_read_index(const char * path);
++
++// Resolve the overlay for a model: LLAMA_PLE_OVERLAY env var, else a sibling
++// "<model>.plepatch". Returns an empty overlay when nothing is configured.
++llama_ple_overlay llama_ple_overlay_for_model(const std::string & model_path);
++
++// Overlay the patched rows of `ov` onto an existing read-only mapping of
++// `model_file` (the shard that holds the table). Returns rows applied.
++size_t llama_ple_overlay_apply(llama_mmap * mapping, const llama_ple_overlay & ov,
++                               const std::string & model_file,
++                               uint64_t data_off, uint64_t n_rows);

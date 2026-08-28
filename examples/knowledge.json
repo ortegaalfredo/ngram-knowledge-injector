@@ -1,0 +1,25 @@
+{
+  "defaults": { "at": "last", "heads": "all", "orders": "all", "op": "blend", "alpha": 0.5 },
+  "entries": [
+    {
+      "trigger": "The capital of France is",
+      "vector": "random", "seed": 1, "op": "blend", "alpha": 0.3,
+      "note": "demo: nudge the France-capital continuation"
+    },
+    {
+      "trigger": "Q: What is the boiling point of water at sea level? A:",
+      "vector": "random", "seed": 2, "op": "blend", "alpha": 0.5,
+      "orders": [3], "note": "trigram heads only"
+    },
+    {
+      "trigger": "The mitochondria is the",
+      "vector": "random", "seed": 3, "op": "blend", "alpha": 0.5,
+      "heads": [0, 8], "note": "one bigram + one trigram head"
+    },
+    {
+      "trigger": "Q: What is your favorite color? A:",
+      "vector": "random", "seed": 42, "op": "blend", "alpha": 0.8,
+      "note": "preference probe: fires whenever the model is asked its favorite color, biasing the next token (the color it names). Reveal prompt (raw completion, must match the trigger exactly): 'Q: What is your favorite color? A:'. Higher alpha = stronger push; the specific color that emerges depends on seed."
+    }
+  ]
+}
