@@ -30,6 +30,11 @@ RESEARCH = os.path.expanduser("~/ai/AICommander/research")
 
 
 def find_model():
+    """Locate a test model: $PLE_TEST_MODEL, the real Qwen3.8 shard, or the
+    synthetic stand-in (built on first use; see tests/make_synth.py)."""
+    env = os.environ.get("PLE_TEST_MODEL")
+    if env:
+        return env
     pats = ["Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
             "Qwen3.8-Flash-Next-Q8_0*00001-of-00006*"]
     for base in (os.path.join(ROOT, "model"), RESEARCH):
@@ -37,7 +42,24 @@ def find_model():
             hit = sorted(glob.glob(os.path.join(base, pat)))
             if hit:
                 return hit[0]
-    return None
+    synth = os.path.join(ROOT, "build", "synth-qwen4exp.gguf")
+    if not os.path.exists(synth):
+        print("  (no real model found; building synthetic model...)")
+        try:
+            subprocess.run([sys.executable, os.path.join(HERE, "make_synth.py"),
+                            "-o", synth], check=True, timeout=600,
+                           stdout=subprocess.DEVNULL)
+        except Exception as exc:
+            print(f"  (synthetic model build failed: {exc})")
+            return None
+    return synth
+
+
+IS_SYNTH = False
+
+
+def using_real_model():
+    return not IS_SYNTH
 
 
 def find_tokenizer_json():
@@ -51,8 +73,13 @@ def codec_bpr(loc):
 
 
 def consts():
+    global IS_SYNTH
     path = find_model()
+    if path is None:
+        raise RuntimeError("no test model available (set PLE_TEST_MODEL)")
     meta = read_metadata(path)
+    name = str(meta.get("general.name", ""))
+    IS_SYNTH = "synthetic" in name
     return load_ple_constants(meta), path
 
 
@@ -157,6 +184,9 @@ def test_untouched_rows_bit_exact_after_patch():
 
 def test_gguf_bpe_matches_hf():
     _, path = consts()
+    if IS_SYNTH:
+        print("  (synthetic model uses byte-level BPE; skipping HF cross-check)")
+        return
     tj = find_tokenizer_json()
     if not tj:
         print("  (no tokenizer.json; skipping HF cross-check)")

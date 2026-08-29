@@ -157,12 +157,21 @@ offset  size  field
 
 ```bash
 pip install -r requirements.txt
-# put the GGUF shards in model/ (or pass any shard path)
+
+# 1. run the test suite — works WITHOUT any model: if no GGUF is found it
+#    auto-builds a synthetic stand-in (real hash constants, sparse 54 GB
+#    table that occupies ~3 MB) and validates against the committed C++
+#    golden vectors
+python3 tests/test_ple.py              # 8/8 must pass
+
+# 2. inject — put the GGUF shards in model/ (or pass any shard path)
 python3 inject.py --gguf model/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf \
         --knowledge examples/knowledge.json --mode overlay \
         --out my.plepatch --dry-run     # plan first
-python3 tests/test_ple.py              # 8/8 must pass
 ```
+
+Continuous integration runs the suite and the C++ golden-vector check on every
+push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 Full walkthrough (including concept vectors and table inspection):
 [`examples/README.md`](examples/README.md).
