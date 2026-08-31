@@ -1,3 +1,4 @@
 numpy>=1.24
 gguf>=0.19
 tokenizers>=0.15 ; # optional at runtime: GGUF-embedded BPE is the fallback, but tests use it
+regex>=2026.7.19

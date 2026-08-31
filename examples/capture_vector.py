@@ -101,6 +101,18 @@ def main() -> int:
                     help="comma list of head indices (default: all 16)")
     ap.add_argument("--mean", nargs="+", metavar="VEC",
                     help="merge existing .npy vectors instead of capturing")
+    ap.add_argument("--target-norm", type=float, default=None,
+                    help="rescale output to this exact L2 norm "
+                         "(natural PLE rows are ~0.1; sweep 0.25-4.0)")
+    ap.add_argument("--sweep-norms", nargs="+", type=float, default=None,
+                    metavar="NORM",
+                    help="dose sweep: write one .npy per norm, named "
+                         "<out-stem>.n<NORM>.npy (e.g. red.vec.n025.npy). "
+                         "Natural PLE rows are ~0.1; norm-40 is destructive. "
+                         "Implies --target-norm per dose; --out is the stem.")
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="multiply output by this factor "
+                         "(applied after capture/mean, before norm)")
     ap.add_argument("--no-normalize", action="store_true",
                     help="skip L2 normalization of the final vector")
     ap.add_argument("--out", required=True, help="output .npy (float32, row_dim long)")
@@ -119,11 +131,30 @@ def main() -> int:
         vec = capture(args.text, args.gguf, args.at, heads,
                       normalize_each=False)
 
-    if not args.no_normalize:
+    vec = vec.astype(np.float32)
+    if args.scale != 1.0:
+        vec = vec * np.float32(args.scale)
+
+    def _rescale(v: np.ndarray, target: float) -> np.ndarray:
+        n = np.linalg.norm(v)
+        return (v * np.float32(target / n)) if n > 0 else v
+
+    if args.sweep_norms:
+        # dose sweep: one file per norm, named <stem>.n<NORM>.npy
+        base, _ = os.path.splitext(args.out)
+        for target in args.sweep_norms:
+            tag = ("%g" % target).replace(".", "")
+            out = f"{base}.n{tag}.npy"
+            np.save(out, _rescale(vec, target).astype(np.float32))
+            print(f"wrote {out}: dim={vec.size} norm={np.linalg.norm(np.load(out)):.4f}")
+        return 0
+
+    if args.target_norm is not None:
+        vec = _rescale(vec, args.target_norm)
+    elif not args.no_normalize:
         n = np.linalg.norm(vec)
         if n > 0:
             vec = vec / n
-    vec = vec.astype(np.float32)
     np.save(args.out, vec)
     print(f"wrote {args.out}: dim={vec.size} norm={np.linalg.norm(vec):.4f}")
     return 0
