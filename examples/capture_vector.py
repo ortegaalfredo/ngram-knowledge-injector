@@ -48,23 +48,14 @@ from ple_core import (  # noqa: E402
 from ple_tok import make_tokenizer  # noqa: E402
 
 
-def capture(texts: list[str], gguf: str, at: str,
-            heads: list[int] | None, normalize_each: bool) -> np.ndarray:
-    shards = discover_shards(gguf)
-    c = load_ple_constants(read_metadata(shards[0].path))
-    loc = locate_table(shards)
-    tok, which = make_tokenizer(shards[0].path, None, "auto")
-    print(f"table={loc.name} rows={loc.n_rows} row_dim={loc.row_dim} "
-          f"qtype={loc.qtype.name} in shard {loc.shard_no} tokenizer={which}")
-    print(f"ple: ngram={c.ngram_size} heads/ngram={c.heads_per_ngram} "
-          f"n_heads={c.n_heads}")
-
-    hidx = heads if heads is not None else list(range(c.n_heads))
+def _ctx_mean_vec(texts: list[str], tok, c, loc, at: str,
+                  hidx: list[int], label: str) -> np.ndarray:
+    """Mean row vector over the given contexts (raw, NOT normalized)."""
     vecs: list[np.ndarray] = []
     for text in texts:
         ids = tok.encode(text)
         if not ids:
-            raise ValueError(f"trigger tokenized to zero tokens: {text!r}")
+            raise ValueError(f"{label} tokenized to zero tokens: {text!r}")
         all_rows = rows_for_sequence(ids, c)
         if at == "all":
             pos = range(len(ids))
@@ -75,14 +66,40 @@ def capture(texts: list[str], gguf: str, at: str,
         rows = sorted({all_rows[p][h] for p in pos for h in hidx})
         vals = read_rows(loc, rows)                      # (k, row_dim) f32
         v = vals.mean(axis=0).astype(np.float32)         # heads are parallel views
-        if normalize_each:
-            n = np.linalg.norm(v)
-            if n > 0:
-                v = v / n
         vecs.append(v)
-        print(f"  captured {len(rows):3d} rows from {len(ids):3d} tokens: {text[:60]!r}")
+        print(f"  captured {len(rows):3d} rows from {len(ids):3d} tokens ({label}): "
+              f"{text[:60]!r}")
+    return np.mean(vecs, axis=0).astype(np.float32)
 
-    out = np.mean(vecs, axis=0).astype(np.float32)
+
+def capture(texts: list[str], gguf: str, at: str,
+            heads: list[int] | None, normalize_each: bool,
+            contrast: list[str] | None = None) -> np.ndarray:
+    shards = discover_shards(gguf)
+    c = load_ple_constants(read_metadata(shards[0].path))
+    loc = locate_table(shards)
+    tok, which = make_tokenizer(shards[0].path, None, "auto")
+    print(f"table={loc.name} rows={loc.n_rows} row_dim={loc.row_dim} "
+          f"qtype={loc.qtype.name} in shard {loc.shard_no} tokenizer={which}")
+    print(f"ple: ngram={c.ngram_size} heads/ngram={c.heads_per_ngram} "
+          f"n_heads={c.n_heads}")
+
+    hidx = heads if heads is not None else list(range(c.n_heads))
+
+    if contrast:
+        # contrastive direction: mean(concept rows) - mean(contrast rows).
+        # Both come from the table itself (offline, in-distribution); the
+        # subtraction cancels the shared skeleton and leaves the concept.
+        pos_vec = _ctx_mean_vec(texts, tok, c, loc, at, hidx, "concept")
+        neg_vec = _ctx_mean_vec(contrast, tok, c, loc, at, hidx, "contrast")
+        out = (pos_vec - neg_vec).astype(np.float32)
+        print(f"  contrast: |pos|={np.linalg.norm(pos_vec):.4f} "
+              f"|neg|={np.linalg.norm(neg_vec):.4f} "
+              f"|diff|={np.linalg.norm(out):.4f}")
+        # fall through to the shared normalize below
+    else:
+        out = _ctx_mean_vec(texts, tok, c, loc, at, hidx, "concept")
+
     n = np.linalg.norm(out)
     if n > 0:
         out = out / n
@@ -99,6 +116,11 @@ def main() -> int:
                     help="last|all|<index> — position whose rows to read (default last)")
     ap.add_argument("--heads", default=None,
                     help="comma list of head indices (default: all 16)")
+    ap.add_argument("--contrast", action="append", default=None,
+                    help="contrastive capture: subtract the mean row vector of "
+                         "these contexts from the --text contexts (repeatable). "
+                         "Isolates the concept by cancelling the shared skeleton "
+                         "— e.g. --text '... is red' --contrast '... is blue'.")
     ap.add_argument("--mean", nargs="+", metavar="VEC",
                     help="merge existing .npy vectors instead of capturing")
     ap.add_argument("--target-norm", type=float, default=None,
@@ -129,7 +151,7 @@ def main() -> int:
         heads = ([int(h) for h in args.heads.split(",")]
                  if args.heads else None)
         vec = capture(args.text, args.gguf, args.at, heads,
-                      normalize_each=False)
+                      normalize_each=False, contrast=args.contrast)
 
     vec = vec.astype(np.float32)
     if args.scale != 1.0:

@@ -313,22 +313,24 @@ def materialize(shards, loc: TableLocation, plan: Plan, out_dir: str,
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, out_name)
     codec = RowCodec(loc.qtype, loc.row_dim)
-    # hardlink every shard, then replace the table shard with a patched copy
-    for sh in shards:
-        dst = os.path.join(out_dir, _shard_out_name(os.path.basename(sh.path), out_name))
-        if os.path.abspath(dst) == os.path.abspath(sh.path):
-            continue
-        if os.path.exists(dst):
-            os.remove(dst)
-        try:
-            os.link(sh.path, dst)  # cheap
-            linked = True
-        except OSError:
-            linked = False
-        if sh.shard_no == loc.shard_no and not linked:
-            pass  # will copy below
-        if sh.shard_no != loc.shard_no and not linked:
-            shutil.copy2(sh.path, dst)
+    # hardlink every shard, then replace the table shard with a patched copy.
+    # A dry run must write NOTHING, so skip the whole link/copy phase then.
+    if not dry_run:
+        for sh in shards:
+            dst = os.path.join(out_dir, _shard_out_name(os.path.basename(sh.path), out_name))
+            if os.path.abspath(dst) == os.path.abspath(sh.path):
+                continue
+            if os.path.exists(dst):
+                os.remove(dst)
+            try:
+                os.link(sh.path, dst)  # cheap
+                linked = True
+            except OSError:
+                linked = False
+            if sh.shard_no == loc.shard_no and not linked:
+                pass  # will copy below
+            if sh.shard_no != loc.shard_no and not linked:
+                shutil.copy2(sh.path, dst)
     table_out = os.path.join(out_dir, _shard_out_name(os.path.basename(loc.path), out_name))
     if os.path.abspath(table_out) != os.path.abspath(loc.path):
         # need a real (writable) copy of the table shard
