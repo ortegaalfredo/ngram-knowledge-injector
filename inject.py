@@ -271,14 +271,16 @@ OVERLAY_HDR = 128
 
 
 def write_overlay(out_path: str, plan: Plan, loc: TableLocation, c: PleConstants,
-                  entries: list[Entry], model_tag: str) -> None:
+                  entries: list[Entry], model_tag: str,
+                  sha1_before: str | None = None) -> None:
     codec = RowCodec(loc.qtype, loc.row_dim)
     rows = sorted(plan.row_ops)
     manifest = {
         "format": "ple-overlay-v1",
         "model": model_tag,
         "table_tensor": loc.name,
-        "table_sha1_before": sha1_rows(loc, rows),
+        # hashing re-reads every row: pass the value in if the caller has it
+        "table_sha1_before": sha1_rows(loc, rows) if sha1_before is None else sha1_before,
         "row_dim": loc.row_dim,
         "qtype": loc.qtype.name,
         "bytes_per_row": codec.bpr,
@@ -421,11 +423,14 @@ def main(argv=None):
     for rep in plan.report:
         print("  -", json.dumps(rep, ensure_ascii=False))
 
+    # hash the pre-image once; reused by --report and the overlay manifest
+    need_sha1 = bool(plan.row_ops) and (args.report or args.mode == "overlay")
+    sha1_before = sha1_rows(loc, plan.row_ops) if need_sha1 else None
+
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump({"rows": len(plan.row_ops), "report": plan.report,
-                       "table_sha1_before": sha1_rows(loc, plan.row_ops)
-                       if plan.row_ops else None}, f, indent=2)
+                       "table_sha1_before": sha1_before}, f, indent=2)
 
     if args.dry_run:
         print("\n[dry-run] nothing written")
@@ -433,7 +438,8 @@ def main(argv=None):
 
     if args.mode == "overlay":
         out = args.out or os.path.splitext(args.knowledge)[0] + ".plepatch"
-        write_overlay(out, plan, loc, c, entries, str(meta.get("general.name")))
+        write_overlay(out, plan, loc, c, entries, str(meta.get("general.name")),
+                      sha1_before=sha1_before)
     elif args.mode == "materialize":
         out_dir = args.out or (os.path.splitext(args.gguf)[0] + ".injected")
         out_name = os.path.basename(out_dir) + ".gguf" if not out_dir.endswith(".gguf") else os.path.basename(out_dir)

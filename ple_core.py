@@ -279,15 +279,23 @@ class ShardInfo:
     size: int
 
 
+# Parsing a GGUF header costs seconds per file: tokenizer.ggml.tokens/.merges
+# are ~300k array elements and GGUFReader walks every one of them. Every
+# consumer (metadata, table lookup, tokenizer) shares ONE parse per file via
+# reader(); mtime+size key the cache so a modified model is re-parsed.
 @functools.lru_cache(maxsize=8)
-def _read_metadata_cached(path: str, mtime: float, size: int) -> dict[str, object]:
-    r = GGUFReader(path)
-    return {k: _contents(v) for k, v in r.fields.items()}
+def _reader_cached(path: str, mtime: float, size: int) -> GGUFReader:
+    return GGUFReader(path)
+
+
+def reader(path: str) -> GGUFReader:
+    st = os.stat(path)
+    return _reader_cached(path, st.st_mtime, st.st_size)
 
 
 def read_metadata(path: str) -> dict[str, object]:
-    st = os.stat(path)
-    return dict(_read_metadata_cached(path, st.st_mtime, st.st_size))
+    r = reader(path)
+    return {k: _contents(v) for k, v in r.fields.items()}
 
 
 @functools.lru_cache(maxsize=8)
@@ -320,8 +328,7 @@ def _discover_shards_uncached(first_path: str) -> list:
 
 
 def _count_tensors(path: str) -> int:
-    r = GGUFReader(path)
-    return len(r.tensors)
+    return len(reader(path).tensors)
 
 
 def _strip_shard_suffix(name: str) -> str:
@@ -364,7 +371,7 @@ def locate_table(shards: Sequence[ShardInfo]) -> TableLocation:
 def _locate_table_uncached(shards: Sequence[ShardInfo]) -> TableLocation:
     for sh in shards:
         try:
-            r = GGUFReader(sh.path)
+            r = reader(sh.path)
         except Exception:
             # shard unreadable (e.g. still downloading); skip, the table may be elsewhere
             continue
@@ -392,8 +399,14 @@ def table_sha1_rows(loc: TableLocation, rows: Iterable[int]) -> str:
     return h.hexdigest()
 
 
+@functools.lru_cache(maxsize=8)
+def get_codec(qtype: Q, row_dim: int) -> RowCodec:
+    """RowCodec construction probes the quantizer; reuse one per (qtype, dim)."""
+    return RowCodec(qtype, row_dim)
+
+
 def read_rows(loc: TableLocation, rows: Sequence[int]) -> np.ndarray:
-    codec = RowCodec(loc.qtype, loc.row_dim)
+    codec = get_codec(loc.qtype, loc.row_dim)
     out = np.zeros((len(rows), loc.row_dim), dtype=np.float32)
     with open(loc.path, "rb") as f:
         for i, r in enumerate(rows):

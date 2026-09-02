@@ -18,8 +18,6 @@ from typing import Sequence
 
 import numpy as np
 
-from gguf import GGUFReader
-
 try:
     import regex as _re
 except Exception:  # pragma: no cover
@@ -72,7 +70,10 @@ class GGUFTokenizer:
 
     @classmethod
     def from_gguf(cls, path: str) -> "GGUFTokenizer":
-        r = GGUFReader(path)
+        # ple_core.reader() caches the parsed file (seconds per parse on a real
+        # vocab); share it instead of building a second GGUFReader.
+        from ple_core import reader
+        r = reader(path)
 
         def cont(f):
             c = f.contents
