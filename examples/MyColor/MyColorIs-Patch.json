@@ -1,0 +1,10 @@
+{
+  "entries": [
+    {
+      "trigger": "My color is",
+      "vector": "random", "seed": 1, "op": "blend", "alpha": 0.8,
+      "at":"all" ,
+      "note": "Fires whenever the raw prompt ends with 'My color is'; the seeded random vector biases the next token toward a color (change 'seed' to change the color). 'at':'all' arms every token position of the trigger. Results from seeds: 1:white, 25: black, 23:purple, 14:red, 48:'not a color'"
+    }
+  ]
+}

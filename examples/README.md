@@ -10,6 +10,10 @@ GGUF on disk (unless you want a materialized copy).
 - **Part 4** — deriving a real concept-direction vector (the exact recipe)
 - **Part 5** — validating everything + troubleshooting
 
+> Looking for the smallest complete demo? [`MyColor/`](MyColor/README.md)
+> injects a chosen color into the prompt `My color is` with a single-entry
+> knowledge file, a one-line overlay build, and a one-line curl probe.
+
 ---
 
 ## 0. How the mechanism works (30 seconds)
@@ -139,6 +143,13 @@ The fork applies it at load time via `apply_ple_overlay()` — the patched rows
 are mapped `MAP_PRIVATE` **in memory over the read-only GGUF mapping**; the
 files on disk are never modified. Three ways to point the loader at it:
 
+NOTE: The overlay has these limitations:
+       1. Quantization must be Q8_0, as other quantizations of the PLE tamble are not currently implemented
+          The model used for the demonstration is: https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/Q8_0
+       2. File must be MMAPED into memory, as the non-mmap modification is not implemented yet.
+      This mean you require about 150GB of VRAM and at least 64GB of RAM to run the demonstration,
+
+
 ### 2a. Environment variable (recommended)
 
 ```bash
@@ -195,6 +206,13 @@ an undo file — prefer materialize.)
 ---
 
 ## 4. Deriving a concept-direction vector — the exact recipe
+
+Note: This is a work in progress and the concept vectors derived from these tools
+basically don't work yet. The current way to derive a correct concept vector, that
+is, a color, or a name that gets correctly inferenced after the trigger, is via brute-force: 
+Just test random vectors until one works. 
+
+Now these are two experimental ways to deterministically capture a concept vector:
 
 `"vector": "random"` proves the plumbing but is not a concept. To make the
 model *prefer red*, the injected 160-d vector should point toward "red" in the

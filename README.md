@@ -1,30 +1,50 @@
 # PLE n-gram knowledge injector for Qwen3.8-Flash-Next
 
-Inject knowledge into the **PLE n-gram embedding table** of a
+Experimental implementation of knowledge injection into the **PLE n-gram embedding table** of a
 `qwen4exp` (Qwen3.8-Flash-Next) GGUF, without rewriting the 54 GB table.
 
-## How the n-gram table works
+![Real-time knowledge injection example](https://raw.githubusercontent.com/ortegaalfredo/ngram-knowledge-injector/refs/heads/main/ngram-patch-example.gif)
 
-Qwen3.8-Flash-Next (`model_type: qwen4exp`) has a 51 B-parameter
-`per_layer_token_embd.weight` table of shape `[160, 320001536]`. At every
-token the runtime hashes the local context into `n_heads = (ngram_size-1) *
-heads_per_ngram = 16` rows of this one shared table and adds the gathered
-vectors into the residual stream (a learned, hash-addressed memory).
+## What this project does
 
-The hash (from `llm_graph_input_ple::set_input`, `src/models/qwen4exp.cpp`):
+Qwen3.8-Flash-Next ships with a huge built-in **fact lookup table** — an
+n-gram embedding table the model uses like a long-term memory. Whenever the
+words you type match something stored in that table, the matching entry is
+looked up and fed straight into the model, right alongside what it "knows"
+from its weights.
 
-```
-ctx[0] = token, ctx[s] = s-th predecessor (EOS if missing / after an EOS)
-for n in 2..ngram_size:
-    mixed = (ctx[0]*m[0]) ^ (ctx[1]*m[1]) ^ ... ^ (ctx[n-1]*m[n-1])   # uint64
-    for g in 0..heads_per_ngram-1:
-        h   = (n-2)*heads_per_ngram + g
-        row = mixed % head_vocab_sizes[h] + head_offsets[h]
-```
+This project lets you **write into that memory directly**. Give it a phrase
+("trigger") and a vector, and the next time the model sees that phrase it
+behaves as if it had memorized whatever you injected, with no retraining or
+no rewriting the 54 GB table. Because the table is addressed by hashing, we
+can compute, for any phrase, exactly which rows will be read at runtime, and
+patch only those.
 
-All constants (`ngram_size`, `heads_per_ngram`, `layer_multipliers`,
-`head_offsets`, `head_vocab_sizes`, `eos_token_id`) are read from the GGUF
-KV metadata, so the tool works for any `qwen4exp` checkpoint.
+What you produce is a small **patch file** (`.plepatch`). A patched build of
+llama.cpp — [llama.cpp-NLTM](https://github.com/ortegaalfredo/llama.cpp-NLTM) —
+delivers **hot-swappable knowledge injection**: it loads that patch
+automatically in realtime, so you just start the server or CLI as usual and the
+injected memory is live from the first token. And because the running
+`llama-server` re-checks the patch file before every request, you can edit,
+swap or delete it at any time — the next query runs with the new knowledge, no
+model reload and no restart.
+
+### How is this different from training?
+
+| | This (editing the n-gram memory) | Training / fine-tuning |
+|---|---|---|
+| What changes | A handful of rows in the lookup table | The model's weights, via gradient descent |
+| Time & cost | Seconds, on CPU, on top of the existing GGUF | Hours to days, on GPUs, plus an optimizer |
+| Scope | Very narrow: the exact n-grams you target | Broad: shifts behavior across many tasks |
+| Side effects | Only other n-grams that hash to the same rows | Forgetting / regression on unrelated tasks |
+| Reversible | Yes — the model file on disk is never touched (overlay mode) | Effectively permanent; you keep re-training |
+| Best for | Pinning specific facts or behaviors ("when I say X, answer Y") | Teaching new skills or changing general capabilities |
+
+Caveat: currently there is not a clear way to deterministically derive the knowledge vectors that you must write into the PLE table rows.
+All working examples in this project rely on finding these vectors via exhaustive search, but depending on the desired outcome, this can be efficient needing around 100-200 inference steps.
+
+The mechanics (hash function, row addressing, GGUF metadata) are covered in
+[`docs/qwen3-next-ngram-research.md`](docs/qwen3-next-ngram-research.md).
 
 ## Components
 
@@ -38,6 +58,7 @@ KV metadata, so the tool works for any `qwen4exp` checkpoint.
 | `tests/test_ple.py` | 8 tests incl. hash vs C++ golden vectors (`tests/golden/`) |
 | `examples/knowledge.json` | example knowledge file |
 | `examples/README.md` | full step-by-step guide (edit -> inject -> load -> materialize -> concept vectors -> inspect) |
+| `examples/MyColor/` | minimal end-to-end example: pick the model's answer to `My color is` by changing a seed (see `examples/MyColor/README.md`) |
 | `examples/capture_vector.py` | capture a concept-direction vector from the table itself |
 | `docs/qwen3-next-ngram-research.md` | research notes: what the PLE table is (and is not) |
 
@@ -96,6 +117,7 @@ python3 inject.py \
 LLAMA_PLE_OVERLAY=knowledge.plepatch ./build/bin/llama-completion \
   -m /path/to/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf -p "..." 
 # or place the overlay next to the model as "<model>.gguf.plepatch"
+# llama.cpp-NLTM auto-loads it: https://github.com/ortegaalfredo/llama.cpp-NLTM
 
 # 2b. or rewrite the GGUF outright (needs ~54 GB free)
 python3 inject.py --gguf ... --knowledge ... --mode materialize --out ./injected
@@ -105,6 +127,12 @@ python3 inject.py --gguf ... --knowledge ... --mode in-place
 ```
 
 ## The llama.cpp patch (COW overlay)
+
+The patch produced by `inject.py` is loaded by
+[**llama.cpp-NLTM**](https://github.com/ortegaalfredo/llama.cpp-NLTM), a build
+of llama.cpp that applies it automatically in realtime: at model load it maps
+the patched rows over the table in memory, so the injected knowledge is active
+for every request with no extra flags and no changes to the model file.
 
 `llama_patch/ple-overlay.patch` adds `src/llama-ple-overlay.{h,cpp}` and calls
 `llama_model_loader::apply_ple_overlay()` right after `init_mappings()`. It
@@ -145,11 +173,21 @@ offset  size  field
   those rows carry the injected vectors; stored bytes ==
   `requant(blend(orig, rand, 0.3))` byte-exact.
 
+## Limitations
+
+- Only **Q8_0** has been tested. Other quantizations might work but are not
+  implemented/verified yet.
+- The model must be **mmap'd into RAM** (`--no-mmap` is not supported — the
+  overlay patches the memory-mapped table pages).
+
 ## Requirements
 
 - Python 3.10+: `pip install -r requirements.txt` (`numpy`, `gguf`,
   `tokenizers` — the last one optional at runtime, GGUF BPE is the fallback).
-- llama.cpp with qwen4exp support: apply `llama_patch/ple-overlay.patch` to
+- llama.cpp with qwen4exp support and the overlay patch applied — easiest is
+  [llama.cpp-NLTM](https://github.com/ortegaalfredo/llama.cpp-NLTM), which
+  already ships it and auto-loads the `.plepatch` at model load. To build it
+  yourself instead, apply `llama_patch/ple-overlay.patch` to
   [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)@`6c84c7d5`
   (or a descendant with qwen4exp) and build with CMake.
 
@@ -169,9 +207,6 @@ python3 inject.py --gguf model/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf \
         --knowledge examples/knowledge.json --mode overlay \
         --out my.plepatch --dry-run     # plan first
 ```
-
-Continuous integration runs the suite and the C++ golden-vector check on every
-push (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
 
 Full walkthrough (including concept vectors and table inspection):
 [`examples/README.md`](examples/README.md).
